@@ -34,19 +34,24 @@ recovered**.
 ## Requirements
 
 - macOS 13+ with a Metal-capable GPU (Apple Silicon or Intel).
-- **Swift toolchain** (Xcode or Command Line Tools): `xcode-select --install`.
-- **ffmpeg**: `brew install ffmpeg` (needed for audio, and for the AI pipeline's frame I/O).
-- **Real-ESRGAN engine** (only for the AI method): `./scripts/install-realesrgan.sh` (~50 MB).
+- **Swift toolchain** (Xcode or Command Line Tools) — `install.sh` launches the
+  installer if it's missing; or run `xcode-select --install` yourself.
+- **ffmpeg** and the **Real-ESRGAN engine** — `install.sh` installs both for you
+  (ffmpeg via Homebrew, Real-ESRGAN via `scripts/install-realesrgan.sh`).
 
 ## Install
 
 ```bash
 git clone <this repo> gpuscale_mac && cd gpuscale_mac
-./install.sh                      # builds + installs all commands to /usr/local/bin
-                                  # (offers to fetch the Real-ESRGAN engine too)
+./install.sh                      # installs deps (ffmpeg + Real-ESRGAN),
+                                  # builds, and installs all commands to /usr/local/bin
 # no sudo:
 PREFIX=~/.local ./install.sh      # installs to ~/.local/bin (ensure it's on PATH)
 ```
+
+`install.sh` flags: `--no-deps` (skip dependency install), `--no-realesrgan`
+(install ffmpeg but skip the AI engine). ffmpeg install needs
+[Homebrew](https://brew.sh); if it's missing the script tells you.
 
 Build/install pieces manually:
 
