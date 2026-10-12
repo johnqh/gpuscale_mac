@@ -1,0 +1,25 @@
+# SwiftPM
+.build/
+.swiftpm/
+Package.resolved
+
+# macOS
+.DS_Store
+
+# Editor
+*.swp
+*~
+.vscode/
+
+# Local test artifacts
+/tmp_*
+*.local.mp4
+
+# build logs
+build.log
+
+# test media / example output
+*.mp4
+*.mov
+*.mkv
+gpuscale_examples_out/

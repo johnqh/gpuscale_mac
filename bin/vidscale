@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+#
+# vidscale — one front door for resizing video, your choice of method:
+#
+#   --method resample    direct GPU anti-aliased resample (gpuscale). Fast, honest,
+#                        best for clean sources and moderate changes (<=~2x).
+#   --method realesrgan  AI super-resolution (Real-ESRGAN). Reconstructs detail;
+#                        best for large upscales from low-res sources (360p/480p).
+#   --method auto        (default) pick based on the upscale factor: resample for
+#                        <=2.0x, realesrgan above that. Prints what it chose & why.
+#
+# Both methods carry the original audio across.
+#
+# Usage:
+#   vidscale <input> <output> [--method auto|resample|realesrgan] [options…]
+#
+# Common options (forwarded to the chosen backend):
+#   -H, --height <px>   -w, --width <px>   -s, --scale <f>   -b, --bitrate <Mbps>
+# resample-only:   -f, --filter lanczos|bicubic    --sharpen <0-2>
+# realesrgan-only: --model animevideov3|x4plus|x4plus-anime   --tmpdir <dir>  --keep-frames
+#
+# See docs/REASONING.md (why) and docs/USAGE.md (all options).
+#
+set -euo pipefail
+
+die() { echo "vidscale: error: $*" >&2; exit 1; }
+info() { echo "$*" >&2; }
+
+METHOD="auto"
+POS=()
+FWD=()            # args forwarded to the backend
+# size hints used only for the auto decision:
+HINT_SCALE=""; HINT_H=""; HINT_W=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --method) METHOD="$2"; shift 2;;
+        -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+        -s|--scale)  HINT_SCALE="$2"; FWD+=("$1" "$2"); shift 2;;
+        -H|--height) HINT_H="$2";     FWD+=("$1" "$2"); shift 2;;
+        -w|--width)  HINT_W="$2";     FWD+=("$1" "$2"); shift 2;;
+        --keep-frames) FWD+=("$1"); shift;;        # bare flag (no value)
+        -*)          FWD+=("$1" "$2"); shift 2;;   # option with value (bitrate/filter/model/…)
+        *)           POS+=("$1"); shift;;
+    esac
+done
+
+[[ ${#POS[@]} -eq 2 ]] || die "expected <input> <output> (try --help)"
+IN="${POS[0]}"; OUT="${POS[1]}"
+[[ -f "$IN" ]] || die "input not found: $IN"
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+run_backend() {
+    local tool="$1"; shift
+    local path
+    if command -v "$tool" >/dev/null; then path="$(command -v "$tool")"
+    elif [[ -x "$SELF_DIR/$tool" ]]; then path="$SELF_DIR/$tool"
+    else die "'$tool' not found (install the project, or run from the repo's bin/)"; fi
+    "$path" "$@"
+}
+
+# --- auto method selection ------------------------------------------------
+if [[ "$METHOD" == "auto" ]]; then
+    ratio=""
+    if [[ -n "$HINT_SCALE" ]]; then
+        ratio="$HINT_SCALE"
+    elif [[ -n "$HINT_H" || -n "$HINT_W" ]]; then
+        command -v ffprobe >/dev/null || die "ffprobe needed for --method auto (brew install ffmpeg)"
+        read -r SW SH < <(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "$IN" | tr ',' ' ')
+        [[ -n "${SW:-}" ]] || die "could not read source size for auto decision"
+        if [[ -n "$HINT_H" ]]; then ratio="$(awk -v a="$HINT_H" -v b="$SH" 'BEGIN{printf "%.4f", a/b}')"
+        else ratio="$(awk -v a="$HINT_W" -v b="$SW" 'BEGIN{printf "%.4f", a/b}')"; fi
+    else
+        die "--method auto needs a size (--height/--width/--scale), or pass --method explicitly"
+    fi
+    if awk -v r="$ratio" 'BEGIN{exit !(r<=2.0)}'; then
+        METHOD="resample"; info "vidscale: auto -> resample  (upscale factor ${ratio}x <= 2.0; resampling is the honest, fast choice)"
+    else
+        METHOD="realesrgan"; info "vidscale: auto -> realesrgan  (upscale factor ${ratio}x > 2.0; AI reconstruction is worth it from a low-res source)"
+    fi
+fi
+
+# --- dispatch -------------------------------------------------------------
+case "$METHOD" in
+    resample)   run_backend gpuscale-full "$IN" "$OUT" "${FWD[@]}";;
+    realesrgan) run_backend realesr-video "$IN" "$OUT" "${FWD[@]}";;
+    *) die "unknown --method '$METHOD' (auto|resample|realesrgan)";;
+esac

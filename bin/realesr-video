@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+#
+# realesr-video — AI video super-resolution pipeline using Real-ESRGAN.
+#
+# Unlike `gpuscale` (which resamples — enlarges existing detail), this
+# *reconstructs* plausible new detail with a neural network. Use it for large
+# upscales from low-res sources (e.g. 360p/480p -> 1080p). See docs/REASONING.md
+# and docs/REALESRGAN.md.
+#
+# Pipeline:  extract frames (ffmpeg) -> Real-ESRGAN (GPU) -> reassemble + audio (ffmpeg)
+#
+# Usage:
+#   realesr-video <input> <output> [options]
+#
+# Options:
+#   --model <name>    animevideov3 | x4plus | x4plus-anime   (default: animevideov3)
+#   -s, --scale <N>   native model scale 2|3|4 (animevideov3 only; x4plus forces 4)
+#   -H, --height <px> final height; picks model scale + resamples to exact size
+#   -w, --width  <px> final width
+#   -b, --bitrate <Mbps>  H.264 bitrate for the reassembled video   (default: 18)
+#       --tmpdir <dir>    where to stage frames (can be tens of GB)  (default: mktemp)
+#       --keep-frames     do not delete the staged frames
+#   -h, --help
+#
+set -euo pipefail
+
+die() { echo "realesr-video: error: $*" >&2; exit 1; }
+info() { echo "$*" >&2; }
+
+MODEL="animevideov3"
+SCALE=""
+TGT_H=""
+TGT_W=""
+BITRATE="18"
+TMPDIR_OPT=""
+KEEP=0
+POS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --model)        MODEL="$2"; shift 2;;
+        -s|--scale)     SCALE="$2"; shift 2;;
+        -H|--height)    TGT_H="$2"; shift 2;;
+        -w|--width)     TGT_W="$2"; shift 2;;
+        -b|--bitrate)   BITRATE="$2"; shift 2;;
+        --tmpdir)       TMPDIR_OPT="$2"; shift 2;;
+        --keep-frames)  KEEP=1; shift;;
+        -h|--help)      sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+        -*)             die "unknown option $1 (try --help)";;
+        *)              POS+=("$1"); shift;;
+    esac
+done
+
+[[ ${#POS[@]} -eq 2 ]] || die "expected <input> <output> (try --help)"
+IN="${POS[0]}"; OUT="${POS[1]}"
+[[ -f "$IN" ]] || die "input not found: $IN"
+
+# --- locate tools ---------------------------------------------------------
+for t in ffmpeg ffprobe; do command -v "$t" >/dev/null || die "'$t' not found (brew install ffmpeg)"; done
+
+REALESRGAN_DIR="${REALESRGAN_DIR:-$HOME/.local/share/gpuscale/realesrgan}"
+RE_BIN="${REALESRGAN_BIN:-}"
+if [[ -z "$RE_BIN" ]]; then
+    if command -v realesrgan-ncnn-vulkan >/dev/null; then RE_BIN="$(command -v realesrgan-ncnn-vulkan)"
+    elif [[ -x "$REALESRGAN_DIR/realesrgan-ncnn-vulkan" ]]; then RE_BIN="$REALESRGAN_DIR/realesrgan-ncnn-vulkan"
+    fi
+fi
+[[ -n "$RE_BIN" && -x "$RE_BIN" ]] || die "realesrgan-ncnn-vulkan not found. Install it: scripts/install-realesrgan.sh"
+RE_MODELS="${REALESRGAN_MODELS:-$(dirname "$RE_BIN")/models}"
+[[ -d "$RE_MODELS" ]] || RE_MODELS="$REALESRGAN_DIR/models"
+[[ -d "$RE_MODELS" ]] || die "Real-ESRGAN models dir not found (looked near the binary and in $REALESRGAN_DIR)"
+
+# --- source properties ----------------------------------------------------
+read -r SRC_W SRC_H < <(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "$IN" | tr ',' ' ')
+[[ -n "${SRC_W:-}" && -n "${SRC_H:-}" ]] || die "could not read source dimensions"
+FPS="$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 "$IN")"
+[[ -n "$FPS" && "$FPS" != "0/0" ]] || FPS="24"
+HAS_AUDIO="$(ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 "$IN" || true)"
+
+# --- resolve model + scale ------------------------------------------------
+case "$MODEL" in
+    animevideov3)  AVAIL_SCALES="2 3 4";;
+    x4plus|x4plus-anime) AVAIL_SCALES="4";;
+    *) die "unknown --model '$MODEL' (animevideov3 | x4plus | x4plus-anime)";;
+esac
+
+# If a final size is requested, derive the needed integer model scale.
+if [[ -n "$TGT_H" || -n "$TGT_W" ]]; then
+    # derive the missing target dim from source aspect
+    if [[ -z "$TGT_H" ]]; then TGT_H="$(awk -v w="$TGT_W" -v sw="$SRC_W" -v sh="$SRC_H" 'BEGIN{printf "%d", (w*sh/sw)}')"; fi
+    if [[ -z "$TGT_W" ]]; then TGT_W="$(awk -v h="$TGT_H" -v sw="$SRC_W" -v sh="$SRC_H" 'BEGIN{printf "%d", (h*sw/sh)}')"; fi
+    if [[ -z "$SCALE" ]]; then
+        needed="$(awk -v tw="$TGT_W" -v th="$TGT_H" -v sw="$SRC_W" -v sh="$SRC_H" 'BEGIN{a=tw/sw; b=th/sh; m=(a>b)?a:b; printf "%f", m}')"
+        SCALE="$(awk -v n="$needed" -v avail="$AVAIL_SCALES" 'BEGIN{split(avail,A," "); pick=A[1]; for(i=1;i<=length(A);i++){A[i]=A[i]+0}; chosen=0; for(i=1;i<=length(A);i++){if(A[i]+0>=n){chosen=A[i]; break}}; if(chosen==0){chosen=A[length(A)]}; printf "%d", chosen}')"
+    fi
+fi
+[[ -n "$SCALE" ]] || SCALE="$([[ "$MODEL" == animevideov3 ]] && echo 4 || echo 4)"
+# x4plus variants only support scale 4
+[[ "$MODEL" == animevideov3 ]] || SCALE=4
+case " $AVAIL_SCALES " in *" $SCALE "*) :;; *) die "--scale $SCALE not supported by model $MODEL (allowed: $AVAIL_SCALES)";; esac
+
+# -n name expected by realesrgan-ncnn-vulkan
+if [[ "$MODEL" == animevideov3 ]]; then RE_NAME="realesr-animevideov3-x${SCALE}"; else RE_NAME="realesrgan-${MODEL}"; fi
+
+SR_W=$(( SRC_W * SCALE )); SR_H=$(( SRC_H * SCALE ))
+# final size: explicit target, else the SR output
+FIN_W="${TGT_W:-$SR_W}"; FIN_H="${TGT_H:-$SR_H}"
+# even dimensions for H.264
+FIN_W=$(( (FIN_W/2)*2 )); FIN_H=$(( (FIN_H/2)*2 ))
+
+NFRAMES="$(ffprobe -v error -select_streams v:0 -count_frames -show_entries stream=nb_read_frames -of csv=p=0 "$IN" 2>/dev/null || echo "?")"
+
+info "realesr-video:"
+info "  source     : ${SRC_W}x${SRC_H} @ ${FPS}fps, frames=${NFRAMES}, audio=$([[ -n "$HAS_AUDIO" ]] && echo yes || echo no)"
+info "  model      : $MODEL  (-n $RE_NAME, scale x${SCALE})  -> SR ${SR_W}x${SR_H}"
+info "  final size : ${FIN_W}x${FIN_H}$([[ "$FIN_W" != "$SR_W" || "$FIN_H" != "$SR_H" ]] && echo '  (lanczos resample after SR)' || echo '')"
+info "  note       : staging frames on disk; this can be large and slow. See docs/REALESRGAN.md"
+
+# --- stage dirs -----------------------------------------------------------
+if [[ -n "$TMPDIR_OPT" ]]; then mkdir -p "$TMPDIR_OPT"; WORK="$(mktemp -d "$TMPDIR_OPT/realesr_XXXXXX")"; else WORK="$(mktemp -d -t realesr)"; fi
+FIN="$WORK/in"; FOUT="$WORK/out"; mkdir -p "$FIN" "$FOUT"
+cleanup() { [[ "$KEEP" == "1" ]] && info "kept frames in $WORK" || rm -rf "$WORK"; }
+trap cleanup EXIT
+
+# --- 1. extract frames ----------------------------------------------------
+info "[1/3] extracting frames -> $FIN"
+ffmpeg -y -loglevel error -i "$IN" -map 0:v:0 "$FIN/%08d.png"
+
+# --- 2. Real-ESRGAN -------------------------------------------------------
+info "[2/3] Real-ESRGAN super-resolution on GPU ($RE_NAME)…"
+"$RE_BIN" -i "$FIN" -o "$FOUT" -n "$RE_NAME" -s "$SCALE" -m "$RE_MODELS" -f png 2>&1 \
+    | grep -viE "queueC|bugsbn|fp16|subgroup|Apple" | grep -v "%" || true
+
+# --- 3. reassemble + audio ------------------------------------------------
+info "[3/3] reassembling + muxing audio…"
+VF=""
+[[ "$FIN_W" != "$SR_W" || "$FIN_H" != "$SR_H" ]] && VF="-vf scale=${FIN_W}:${FIN_H}:flags=lanczos"
+
+if [[ -n "$HAS_AUDIO" ]]; then
+    # shellcheck disable=SC2086
+    ffmpeg -y -loglevel error \
+        -framerate "$FPS" -i "$FOUT/%08d.png" \
+        -i "$IN" \
+        -map 0:v:0 -map 1:a:0 \
+        $VF -c:v libx264 -preset slow -b:v "${BITRATE}M" -pix_fmt yuv420p \
+        -r "$FPS" -fps_mode cfr -c:a copy -movflags +faststart -shortest "$OUT"
+else
+    # shellcheck disable=SC2086
+    ffmpeg -y -loglevel error \
+        -framerate "$FPS" -i "$FOUT/%08d.png" \
+        $VF -c:v libx264 -preset slow -b:v "${BITRATE}M" -pix_fmt yuv420p \
+        -r "$FPS" -fps_mode cfr -movflags +faststart "$OUT"
+fi
+
+info "realesr-video: wrote $OUT  (${FIN_W}x${FIN_H})"

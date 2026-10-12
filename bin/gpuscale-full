@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+#
+# gpuscale-full — end-to-end wrapper: GPU-resample the video AND carry the
+# original audio across, by muxing with ffmpeg (no audio re-encode).
+#
+# This is the "batteries-included" counterpart to the core `gpuscale` binary,
+# which is deliberately video-only. See docs/FFMPEG.md for the reasoning and
+# for more advanced ffmpeg integration patterns.
+#
+# Usage:
+#   gpuscale-full <input> <output> [gpuscale options...]
+#
+# Examples:
+#   gpuscale-full in.mp4 out.mp4 --height 1080
+#   gpuscale-full in.mp4 out.mp4 -s 1.5 -b 20 -f bicubic
+#
+set -euo pipefail
+
+if [[ $# -lt 2 ]]; then
+    echo "usage: gpuscale-full <input> <output> [gpuscale options...]" >&2
+    exit 2
+fi
+
+IN="$1"; OUT="$2"; shift 2
+
+for tool in gpuscale ffmpeg ffprobe; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        echo "gpuscale-full: error: '$tool' not found on PATH" >&2
+        [[ "$tool" == "gpuscale" ]] && echo "  -> build/install this project (see install.sh)" >&2
+        [[ "$tool" == ffmpeg || "$tool" == ffprobe ]] && echo "  -> install ffmpeg:  brew install ffmpeg" >&2
+        exit 1
+    fi
+done
+
+[[ -f "$IN" ]] || { echo "gpuscale-full: error: input not found: $IN" >&2; exit 1; }
+
+TMP="$(mktemp -t gpuscale_XXXXXX).mp4"
+cleanup() { rm -f "$TMP"; }
+trap cleanup EXIT
+
+echo "[1/2] GPU resample (video)…" >&2
+gpuscale "$IN" "$TMP" "$@"
+
+# Does the source actually have an audio track?
+HAS_AUDIO="$(ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 "$IN" || true)"
+
+if [[ -n "$HAS_AUDIO" ]]; then
+    echo "[2/2] Muxing original audio (copy)…" >&2
+    ffmpeg -y -loglevel error -i "$TMP" -i "$IN" \
+        -map 0:v:0 -map 1:a:0 -c copy -movflags +faststart "$OUT"
+else
+    echo "[2/2] No audio track in source — writing video only." >&2
+    ffmpeg -y -loglevel error -i "$TMP" -c copy -movflags +faststart "$OUT"
+fi
+
+echo "gpuscale-full: wrote $OUT" >&2
